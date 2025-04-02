@@ -76,18 +76,38 @@ spark-sql ()>
 CREATE DATABASE security_graph;
 
 CREATE EXTERNAL TABLE security_graph.Users (
-  user_id BIGINT,
-  username STRING
+  user_id               BIGINT,
+  username              STRING,
+  email                 STRING,
+  phone                 STRING,
+  created_at            TIMESTAMP,
+  last_login            TIMESTAMP,
+  account_status        STRING,
+  authentication_method STRING,
+  failed_login_attempts INT
 ) USING iceberg;
 
 CREATE EXTERNAL TABLE security_graph.InternetGateways (
-  internet_gateway_id BIGINT,
-  name STRING
+  internet_gateway_id   BIGINT,
+  name                  STRING,
+  region                STRING,
+  status                STRING
 ) USING iceberg;
 
 CREATE EXTERNAL TABLE security_graph.UserInternetGatewayAccess (
-  user_id BIGINT,
-  internet_gateway_id BIGINT
+  user_id               BIGINT,
+  internet_gateway_id   BIGINT,
+  access_level          STRING,
+  granted_at            TIMESTAMP,
+  expires_at            TIMESTAMP,
+  last_accessed_at      TIMESTAMP
+) USING iceberg;
+
+CREATE EXTERNAL TABLE security_graph.UserInternetGatewayAccessLog (
+  log_id                BIGINT,
+  user_id               BIGINT,
+  internet_gateway_id   BIGINT,
+  access_time           TIMESTAMP
 ) USING iceberg;
 
 CREATE EXTERNAL TABLE security_graph.VPCs (
@@ -171,13 +191,38 @@ CREATE EXTERNAL TABLE security_graph.IngressRuleInternetGateway (
 ) USING iceberg;
 
 INSERT INTO security_graph.Users
-SELECT * FROM parquet.`/parquet_data/Users.parquet`;
+SELECT
+    user_id,
+    username,
+    email,
+    phone,
+    CAST(created_at AS TIMESTAMP),
+    CAST(last_login AS TIMESTAMP),
+    account_status,
+    authentication_method,
+    failed_login_attempts
+FROM parquet.`/parquet_data/Users.parquet`;
 
 INSERT INTO security_graph.InternetGateways
 SELECT * FROM parquet.`/parquet_data/InternetGateways.parquet`;
 
 INSERT INTO security_graph.UserInternetGatewayAccess
-SELECT * FROM parquet.`/parquet_data/UserInternetGatewayAccess.parquet`;
+SELECT
+    user_id,
+    internet_gateway_id,
+    access_level,
+    CAST(granted_at AS TIMESTAMP),
+    CAST(expires_at AS TIMESTAMP),
+    CAST(last_accessed_at AS TIMESTAMP)
+FROM parquet.`/parquet_data/UserInternetGatewayAccess.parquet`;
+
+INSERT INTO security_graph.UserInternetGatewayAccessLog
+SELECT
+    log_id,
+    user_id,
+    internet_gateway_id,
+    CAST(access_time AS TIMESTAMP)
+FROM parquet.`/parquet_data/UserInternetGatewayAccessLog.parquet`;
 
 INSERT INTO security_graph.VPCs
 SELECT * FROM parquet.`/parquet_data/VPCs.parquet`;
@@ -220,6 +265,7 @@ SELECT * FROM parquet.`/parquet_data/IngressRules.parquet`;
 
 INSERT INTO security_graph.IngressRuleInternetGateway 
 SELECT * FROM parquet.`/parquet_data/IngressRuleInternetGateway.parquet`;
+
 ```
 - Exit the Spark-SQL shell:
 ```sql
@@ -234,29 +280,116 @@ quit;
 2. Upload the schema:
 - Select the file `schema.json` in the Upload Graph Schema JSON section and click on Upload.
 
-## Querying the Graph using Gremlin
+## Querying the Graph using Gremlin and Cypher
 
-- Navigate to the Query panel on the left side. The Gremlin Query tab offers an interactive environment for querying the graph using Gremlin.
+- Navigate to the Query panel on the left side. The Graph Query tab offers an interactive environment for querying the graph using Gremlin and Cypher.
 - After each query, remember to clear the graph panel before executing the next query to maintain a clean visualization. 
-  You can do this by clicking the "Clear" button located in the top-right corner of the page.
+  You can do this by clicking the "Clear Canvas" button located in the top-right corner of the page.
 
 Example Queries:
-1. Find network interfaces that are not protected by any security group, along with their associated virtual machine instances (if any), as these interfaces may pose security risks.
+1. Tracing Admin Access Paths from Users to Internet Gateways.
+
+**gremlin:**
 ```gremlin
-g.V().hasLabel('NetworkInterface').as('ni')
-  .where(
-    __.not(
-      __.in('PROTECTS').hasLabel('SecurityGroup')
-    )
-  )
-  .optional(
-    __.out('ATTACHED_TO').hasLabel('VMInstance').as('vm')
-  )
+g.V().hasLabel('User').as('user')
+  .outE('ACCESS').has('access_level', 'admin').as('edge')
+  .inV()
   .path()
+  
+```
+**cypher:**
+```cypher
+MATCH path = (u:User)-[r:ACCESS {access_level: 'admin'}]->(ig:InternetGateway)
+RETURN u,r,ig
+```
+
+2. Retrieve All Access Records for User (user_id=123) Sorted by Access Time.
+
+**gremlin:**
+```gremlin
+g.V("User[100]")
+  .outE('ACCESS_RECORD')
+  .has('access_time', gt("2024-12-01 00:00:00"))
+  .order().by('access_time', desc)
+  .valueMap()
+
+```
+**cypher:**
+```cypher
+MATCH (u:User)-[r:ACCESS_RECORD]->(ig:InternetGateway)
+WHERE id(u)="User[100]" AND r.access_time > datetime("2024-12-01T00:00:00")
+RETURN r
+ORDER BY r.access_time DESC
+```
+
+3. Top 10 Users with Highest Access Record Count.
+
+**gremlin:**
+```gremlin
+g.V().hasLabel('User')
+  .project('user','accessCount')
+    .by(valueMap('user_id','username','phone','email'))
+    .by(
+      outE('ACCESS_RECORD')
+        .has('access_time', gt("2024-01-01 00:00:00"))
+        .has('access_time', lt("2025-3-31 23:59:59"))
+        .count()
+    )
+  .order().by(select('accessCount'), desc)
+  .limit(10)
+
+```
+**cypher:**
+```cypher
+MATCH (u:User)
+OPTIONAL MATCH (u)-[r:ACCESS_RECORD]->(ig:InternetGateway)
+WHERE r.access_time >= datetime("2024-01-01T00:00:00") 
+  AND r.access_time <= datetime("2025-03-31T23:59:59")
+WITH u, count(r) AS accessCount
+RETURN id(u) AS user_id, u.username AS username, u.phone AS phone, u.email AS email, accessCount
+ORDER BY accessCount DESC
+LIMIT 10
+
+```
+4. Aggregate Total Access Count per Region.
+
+**gremlin:**
+```gremlin
+g.V().hasLabel('InternetGateway').
+  project('region','accessCount').
+    by('region').
+    by(inE('ACCESS_RECORD').count()).
+  group().
+    by(select('region')).
+    by(__.fold().unfold().select('accessCount').sum()).
+  order().by(region')
+    
+```
+**cypher:**
+```cypher
+MATCH (ig:InternetGateway)
+OPTIONAL MATCH (ig)<-[r:ACCESS_RECORD]-()
+WITH ig.region AS region, count(r) AS accessCount
+RETURN region, sum(accessCount) AS totalAccessCount
 
 ```
 
-2. Find all public IP addresses exposed to the internet, along with their associated virtual machine instances, security groups, subnets, VPCs, internet gateways, and users, displaying all these entities in the traversal path.
+5. Find network interfaces that are not protected by any security group, along with their associated virtual machine instances (if any), as these interfaces may pose security risks.
+
+**cypher:**
+```cypher
+MATCH (ni:NetworkInterface)
+OPTIONAL MATCH (sg:SecurityGroup)-[:PROTECTS]->(ni)
+WITH ni, sg
+WHERE sg IS NULL
+OPTIONAL MATCH (ni)-[:ATTACHED_TO]->(vm:VMInstance)
+RETURN ni, vm
+
+```
+
+6. Find all public IP addresses exposed to the internet, along with their associated virtual machine instances, security groups, subnets, VPCs, internet gateways, and users, displaying all these entities in the traversal path.
+
+**gremlin:**
 ```gremlin 
   g.V().hasLabel('PublicIP').as('ip')
   .in('HAS_PUBLIC_IP').as('ni')
@@ -273,14 +406,33 @@ g.V().hasLabel('NetworkInterface').as('ni')
     .in('GATEWAY_TO').hasLabel('InternetGateway').as('igw')
     .in('ACCESS').hasLabel('User').as('user')
   .path()
+  .limit(1000)
+  
+```
+**cypher:**
+```cypher
+MATCH (ip:PublicIP)<-[hp:HAS_PUBLIC_IP]-(ni:NetworkInterface)
+MATCH (ni)<-[pr:PROTECTS]-(sg:SecurityGroup)
+MATCH (sg)-[hr:HAS_RULE]->(rule:IngressRule)-[atf:ALLOWS_TRAFFIC_FROM]->(igRule:InternetGateway)
+MATCH (ni)-[at:ATTACHED_TO]->(vm:VMInstance)
+MATCH (ni)<-[hi:HOSTS_INTERFACE]-(subnet:Subnet)
+MATCH (subnet)<-[con:CONTAINS]-(vpc:VPC)
+MATCH (vpc)<-[gt:GATEWAY_TO]-(ig:InternetGateway)
+MATCH (ig)<-[ac:ACCESS]-(user:User)
+RETURN ip, hp, ni, hr, rule, atf, igRule,
+       at, vm,
+       hi, subnet, con, vpc, gt, ig, ac, user
+LIMIT 1000
 
 ```
 
-3. Find roles that have been granted excessive access permissions, along with their associated virtual machine instances.
+7. Find roles that have been granted excessive access permissions, along with their associated virtual machine instances.
+
+**gremlin:**
 ```gremlin
 g.V().hasLabel('Role').as('role')
  .where(
-   __.out('ALLOWS_ACCESS_TO').count().is(gt(4))
+   __.out('ALLOWS_ACCESS_TO').count().is(gt(4L))
  )
  .out('ALLOWS_ACCESS_TO').hasLabel('Resource').as('resource')
  .select('role') 
@@ -288,8 +440,19 @@ g.V().hasLabel('Role').as('role')
  .path()
 
 ```
+**cypher:**
+```cypher
+MATCH (r:Role)-[:ALLOWS_ACCESS_TO]->(res:Resource)
+WITH r, count(res) AS permissionCount
+WHERE permissionCount > 4
+MATCH path = (vm:VMInstance)-[ar:ASSIGNED_ROLE]->(r)-[at:ALLOWS_ACCESS_TO]->(res:Resource)
+RETURN vm,ar,r,at,res
 
-4. Find security groups that have ingress rules permitting traffic from any IP address (0.0.0.0/0) to sensitive ports (22 or 3389), and retrieve the associated ingress rules, network interfaces, and virtual machine instances in the traversal path.
+```
+
+8. Find security groups that have ingress rules permitting traffic from any IP address (0.0.0.0/0) to sensitive ports (22 or 3389), and retrieve the associated ingress rules, network interfaces, and virtual machine instances in the traversal path.
+
+**gremlin:**
 ```gremlin
 g.V().hasLabel('SecurityGroup').as('sg')
   .out('HAS_RULE')
@@ -302,6 +465,16 @@ g.V().hasLabel('SecurityGroup').as('sg')
   .path()
 
 ```
+**cypher:**
+```cypher
+MATCH (sg:SecurityGroup)-[hr:HAS_RULE]->(rule:IngressRule)
+WHERE rule.source = '0.0.0.0/0' AND rule.port_range IN ['22','3389']
+MATCH (sg)-[p:PROTECTS]->(ni:NetworkInterface)
+MATCH (ni)-[at:ATTACHED_TO]->(vm:VMInstance)
+RETURN sg, hr, rule, p, ni, at, vm
+
+```
+
 
 ## Cleanup and Teardown
 - To stop and remove the containers, networks, and volumes, run:
